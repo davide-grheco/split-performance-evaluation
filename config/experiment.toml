@@ -1,0 +1,46 @@
+[experiment]
+name = "revision_v1"
+description = "Full benchmark revision run"
+base_seed = 42
+
+[data]
+root = "Data/merck"
+cv_root = "Splits/merck"          # reuse existing outer CV folds
+datasets = ["3A4", "CB1", "DPP4", "HIVINT", "HIVPROT", "LOGD",
+            "METAB", "NK1", "OX1", "OX2", "PGP", "PPB", "RAT_F", "TDI", "THROMBIN"]
+# subsample_n = 1000              # optional: subsample outer-train to this many compounds
+# subsample_seed_offset = 99      # seed offset separating subsample draws from split seeds
+
+[splitting]
+methods = ["random", "kennardstone", "mdks", "butina",
+           "spxy-jaccard", "optisim", "maximum_dissimilarity",
+           "minimum_dissimilarity", "morais",
+           "kmeans_stratified", "kmeans_shuffle",
+           "kmedoids_stratified", "kmedoids_shuffle",
+           "hac_stratified", "hac_shuffle"]
+ratios = [0.8]    # train fractions to evaluate (list for multi-ratio runs)
+repeats = 5
+k_folds = 5
+
+[models]
+methods = ["lightgbm"]   # extensible; future: "random_forest", "xgboost"
+n_runs = 10              # independent training runs per split (variance estimation)
+  [models.lightgbm]
+  n_estimators = 500
+  learning_rate = 0.05
+
+[applicability_domain]
+method = "knn_distance"
+k = 5
+z = 1.5
+
+[layer2]
+model_candidates = ["lightgbm", "random_forest", "knn", "svr", "elasticnet"]
+tpe_budget       = 35
+# Cap training rows used during TPE trials to keep SVR tractable on large datasets
+# (3A4/LOGD have ~37k compounds; SVR is O(n²) so 37k→5k is ~55× faster per fit).
+# The champion is still retrained on the full fold before predictions are written.
+tpe_subsample_n  = 5000
+
+[output]
+root = "experiments"    # experiments/{name}/...

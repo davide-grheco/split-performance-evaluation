@@ -1,0 +1,42 @@
+[experiment]
+name = "revision_v1_sub150"
+description = "Benchmark with 150-sample subsampled outer-CV folds"
+base_seed = 42
+
+[data]
+root = "Data/merck"
+cv_root = "Splits/merck"
+datasets = ["3A4", "CB1", "DPP4", "HIVINT", "HIVPROT", "LOGD",
+            "METAB", "NK1", "OX1", "OX2", "PGP", "PPB", "RAT_F", "TDI", "THROMBIN"]
+subsample_n = 150
+subsample_seed_offset = 99
+
+[splitting]
+methods = ["random", "kennardstone", "mdks", "butina",
+           "spxy-jaccard", "optisim", "maximum_dissimilarity",
+           "minimum_dissimilarity", "morais",
+           "kmeans_stratified", "kmeans_shuffle",
+           "kmedoids_stratified", "kmedoids_shuffle",
+           "hac_stratified", "hac_shuffle"]
+ratios = [0.8]
+repeats = 5
+k_folds = 5
+
+[models]
+methods = ["lightgbm"]
+n_runs = 10
+  [models.lightgbm]
+  n_estimators = 500
+  learning_rate = 0.05
+
+[applicability_domain]
+method = "knn_distance"
+k = 5
+z = 1.5
+
+[layer2]
+model_candidates = ["lightgbm", "random_forest", "knn", "svr", "elasticnet"]
+tpe_budget       = 35
+
+[output]
+root = "experiments"

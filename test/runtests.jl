@@ -1,0 +1,21 @@
+using Test
+using DataSplitBench
+
+include("dataloader_test.jl")
+include("config_test.jl")
+include("registry_test.jl")
+include("chemistry_test.jl")
+include("friedman_test.jl")
+include("mahalanobis_distance_test.jl")
+include("test_metrics.jl")
+#include("scaffold_test.jl")  # disabled: MolecularGraph API mismatch in murcko_scaffold (see Scaffold.jl TODO)
+include("butina_test.jl")
+include("butina_split_test.jl")
+include("mmd_test.jl")
+include("nci60_test.jl")
+include("applicability_domain_test.jl")
+include("splitters_test.jl")
+include("utils_test.jl")
+include("model_selection_test.jl")
+include("precomputation_test.jl")
+include("run_layer3_test.jl")

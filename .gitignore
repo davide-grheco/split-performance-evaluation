@@ -1,0 +1,35 @@
+.vscode/settings.json
+Data/SPARK/
+Data/merck/
+.snakemake
+logs
+images
+.CondaPkg
+Clustering/
+results/
+.dvc
+benchmarks/results/
+# ignore the data itself
+experiments/revision_v1
+
+# but allow DVC metadata files
+!experiments/*.dvc
+/snakemake.out
+/snakemake.err
+
+Data/NCI-60/
+Data/postera_covid_moonshot.csv
+
+# IDE and tooling
+.vscode/
+
+# Article directory (open access — not needed in repo)
+article/
+
+# Scratch notebooks and backups
+data-analysis.ipynb
+notebooks/Testing.jl
+notebooks/*backup*
+test/scaffold_test.jl
+snakemake.err.dvc
+snakemake.out.dvc

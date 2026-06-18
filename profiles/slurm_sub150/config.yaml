@@ -1,0 +1,89 @@
+executor: slurm
+
+jobs: 380
+cores: 2000
+
+latency-wait: 90
+rerun-incomplete: true
+printshellcmds: true
+show-failed-logs: true
+retries: 1
+keep-going: true
+
+slurm-status-command: sacct
+slurm-logdir: ".snakemake/slurm_logs"
+slurm-keep-successful-logs: true
+slurm-delete-logfiles-older-than: 30
+
+default-resources:
+  runtime: "6h"
+  constraint: "clk"
+
+set-threads:
+  split_one: 1
+  run_model: 1
+  run_model_selection: 4
+  run_ad_annotation: 1
+  run_ad_annotation_champion: 1
+  compute_split_metrics_one: 1
+
+set-resources:
+  split_one:
+    mem_mb: 10000
+    runtime: "6h"
+    cpus_per_task: 1
+  run_model:
+    mem_mb: 4000
+    runtime: "6h"
+    cpus_per_task: 1
+  run_model_selection:
+    mem_mb: 20000
+    runtime: "6h"
+    cpus_per_task: 4
+  run_ad_annotation:
+    mem_mb: 2000
+    runtime: "6h"
+    cpus_per_task: 1
+  run_ad_annotation_champion:
+    mem_mb: 2000
+    runtime: "6h"
+    cpus_per_task: 1
+  compute_split_metrics_one:
+    mem_mb: 8000
+    runtime: "6h"
+    cpus_per_task: 1
+  aggregate_layer1:
+    runtime: "6h"
+    cpus_per_task: 1
+  gather_predictions:
+    mem_mb: 8000
+    runtime: "6h"
+    cpus_per_task: 1
+  gather_model_selection:
+    mem_mb: 8000
+    runtime: "6h"
+    cpus_per_task: 1
+  gather_ad_annotation:
+    mem_mb: 8000
+    runtime: "6h"
+    cpus_per_task: 1
+  gather_ad_annotation_champion:
+    mem_mb: 8000
+    runtime: "6h"
+    cpus_per_task: 1
+  gather_split_metrics:
+    mem_mb: 4000
+    runtime: "6h"
+    cpus_per_task: 1
+
+# Larger groups: sub150 jobs are fast, so batching more per SLURM slot reduces
+# scheduling overhead without wasting queue time.
+groups:
+  run_model: model_batch
+  run_ad_annotation: ad_annotation_batch
+  run_ad_annotation_champion: ad_annotation_champion_batch
+
+group-components:
+  model_batch: 5
+  ad_annotation_batch: 4
+  ad_annotation_champion_batch: 4

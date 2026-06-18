@@ -1,0 +1,5 @@
+outs:
+- md5: 6c18b3c6ca3d2e73233810ee37f80cc6
+  size: 379254
+  hash: md5
+  path: cv_splits.jld2

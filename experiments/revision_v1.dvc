@@ -1,0 +1,6 @@
+outs:
+- md5: 8a78678799be3ec86e4c7b2ff74a7f48.dir
+  size: 14616494867
+  nfiles: 2734
+  hash: md5
+  path: revision_v1

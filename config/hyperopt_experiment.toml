@@ -1,0 +1,38 @@
+[experiment]
+name = "hyperopt_v1"
+description = """
+Evaluate which splitting strategy leads to the best model generalisation when
+hyperparameters are selected via inner k-fold CV on the train set.
+
+For every (dataset, splitter, rep, fold) combination:
+  1. Inner CV grid search selects the best hyperparameter configuration.
+  2. Best model is retrained on the full train set.
+  3. Performance is measured on the inner test set and the external IPS set.
+
+Comparing IPS performance across splitting strategies reveals which split
+strategy produces a training distribution that is most useful for selecting
+well-generalising models.
+"""
+base_seed = 42
+
+[data]
+root    = "Data/merck"
+cv_root = "Splits/merck"   # reuse existing outer CV folds
+datasets = ["3A4", "CB1", "DPP4", "HIVINT", "HIVPROT", "LOGD",
+            "METAB", "NK1", "OX1", "OX2", "PGP", "PPB", "RAT_F", "TDI", "THROMBIN"]
+
+[splitting]
+methods = ["random", "kennardstone", "mdks", "butina",
+           "spxy-jaccard", "optisim", "maximum_dissimilarity",
+           "minimum_dissimilarity", "morais"]
+ratios  = [0.8]
+repeats = 5
+k_folds = 5   # also used as the number of inner CV folds for hyperopt
+
+[models]
+methods    = ["lightgbm", "random_forest", "knn", "svr", "elasticnet"]
+n_runs     = 1        # hyperopt already averages over CV; single final model per split
+tpe_budget = 50       # number of TPE evaluations per hyperopt run
+
+[output]
+root = "experiments"   # experiments/hyperopt_v1/...

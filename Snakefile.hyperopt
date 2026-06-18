@@ -1,0 +1,214 @@
+# Snakefile.hyperopt — hyperparameter optimisation experiment.
+#
+# For each (dataset, splitter, ratio, rep, fold, model) combination:
+#   1. Apply the splitting strategy to the outer-CV fold  →  split JLD2
+#   2. Run inner-CV grid search (run_hyperopt.jl)          →  prediction shard
+#   3. Gather shards per (dataset, model)                  →  Arrow file
+#
+# Usage:
+#   EXPERIMENT_CONFIG=config/hyperopt_experiment.toml \
+#       snakemake -s Snakefile.hyperopt --cores 8
+#
+#   # HPC with SLURM:
+#   EXPERIMENT_CONFIG=config/hyperopt_experiment.toml \
+#       snakemake -s Snakefile.hyperopt --profile profiles/slurm
+
+import os
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        raise RuntimeError(
+            "Python 3.11+ (tomllib) or the 'tomli' package is required. "
+            "Install with: pip install tomli"
+        )
+
+# ---------------------------------------------------------------------------
+# Load experiment config
+# ---------------------------------------------------------------------------
+
+_cfg_path = os.environ.get("EXPERIMENT_CONFIG", "config/hyperopt_experiment.toml")
+
+with open(_cfg_path, "rb") as _f:
+    _cfg = tomllib.load(_f)
+
+EXP_NAME  = _cfg["experiment"]["name"]
+BASE_SEED = _cfg["experiment"].get("base_seed", 42)
+
+DATA_ROOT = _cfg["data"]["root"]
+CV_ROOT   = _cfg["data"]["cv_root"]
+DATASETS  = _cfg["data"]["datasets"]
+
+SPLITTERS = _cfg["splitting"]["methods"]
+RATIOS    = [str(r) for r in _cfg["splitting"].get("ratios", [0.8])]
+REPEATS   = _cfg["splitting"].get("repeats", 5)
+KFOLDS    = _cfg["splitting"].get("k_folds", 5)
+
+MODEL_METHODS = _cfg["models"]["methods"]
+
+OUT_ROOT = os.path.join(_cfg["output"]["root"], EXP_NAME)
+
+REPS  = [str(i) for i in range(1, REPEATS + 1)]
+FOLDS = [str(i) for i in range(1, KFOLDS + 1)]
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def cv_path(dataset):
+    return os.path.join(CV_ROOT, dataset, "cv", "cv_splits.jld2")
+
+def split_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "splits", dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.jld2",
+    )
+
+def shard_path(dataset, model, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "hyperopt_predictions", "shards",
+        dataset, model, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def predictions_path(dataset, model):
+    return os.path.join(OUT_ROOT, "hyperopt_predictions", dataset, f"{model}.arrow")
+
+# ---------------------------------------------------------------------------
+# Target collections
+# ---------------------------------------------------------------------------
+
+ALL_SPLITS = [
+    split_path(d, s, r, rep, f)
+    for d   in DATASETS
+    for s   in SPLITTERS
+    for r   in RATIOS
+    for rep in REPS
+    for f   in FOLDS
+]
+
+ALL_SHARDS = [
+    shard_path(d, m, s, r, rep, f)
+    for d   in DATASETS
+    for m   in MODEL_METHODS
+    for s   in SPLITTERS
+    for r   in RATIOS
+    for rep in REPS
+    for f   in FOLDS
+]
+
+ALL_PREDICTIONS = [
+    predictions_path(d, m)
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+rule all:
+    input:
+        ALL_PREDICTIONS,
+
+
+rule split_one:
+    """Apply one splitting algorithm to one outer-CV (rep, fold) at a given ratio."""
+    input:
+        cv=lambda wc: cv_path(wc.dataset),
+    output:
+        out=os.path.join(
+            OUT_ROOT, "splits", "{dataset}", "{splitter}",
+            "ratio{ratio}", "rep{rep}_fold{fold}.jld2",
+        ),
+    params:
+        frac=lambda wc: wc.ratio,
+        seed=lambda wc: BASE_SEED + int(wc.rep) * 1000 + int(wc.fold),
+        cfg=_cfg_path,
+    threads: 1
+    resources:
+        mem_mb=16000,
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(
+            OUT_ROOT, "logs", "splits",
+            "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+        ),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        julia --project=. scripts/run_split.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" \
+            "{input.cv}" "{wildcards.rep}" "{wildcards.fold}" \
+            "{output.out}" "{params.frac}" "{params.seed}" \
+            > {log} 2>&1
+        """
+
+
+rule run_hyperopt:
+    """Inner-CV hyperparameter search + evaluation for one (splitter, ratio, rep, fold, model)."""
+    input:
+        split=lambda wc: split_path(
+            wc.dataset, wc.splitter, wc.ratio, wc.rep, wc.fold
+        ),
+    output:
+        shard=os.path.join(
+            OUT_ROOT, "hyperopt_predictions", "shards",
+            "{dataset}", "{model}", "{splitter}", "ratio{ratio}",
+            "rep{rep}_fold{fold}.arrow",
+        ),
+    params:
+        cfg=_cfg_path,
+    threads: 1
+    resources:
+        mem_mb=32000,
+        runtime=720,
+        cpus_per_task=1,
+    log:
+        os.path.join(
+            OUT_ROOT, "logs", "hyperopt",
+            "{dataset}-{model}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+        ),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.shard})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        julia --project=. scripts/run_hyperopt.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+            "{wildcards.model}" "{wildcards.rep}" "{wildcards.fold}" \
+            "{input.split}" "{output.shard}" \
+            > {log} 2>&1
+        """
+
+
+rule gather_hyperopt:
+    """Concatenate all shards for one (dataset, model) into a single Arrow file."""
+    input:
+        shards=lambda wc: [
+            shard_path(wc.dataset, wc.model, s, r, rep, f)
+            for s   in SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        out=os.path.join(OUT_ROOT, "hyperopt_predictions", "{dataset}", "{model}.arrow"),
+    threads: 1
+    resources:
+        mem_mb=8000,
+        runtime=60,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "gather", "{dataset}-{model}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})"
+        julia --project=. scripts/gather_predictions.jl \
+            "{output.out}" {input.shards} \
+            > {log} 2>&1
+        """

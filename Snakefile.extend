@@ -1,0 +1,770 @@
+# Snakefile.extend — append new splitting methods to an existing experiment.
+#
+# Runs only the NEW_SPLITTERS through the full pipeline and appends their
+# results to the existing gathered Arrow files, without recomputing anything
+# for the methods that are already done.
+#
+# Usage:
+#   EXPERIMENT_CONFIG=config/experiment_sub1000.toml \
+#       snakemake -s Snakefile.extend --cores 8
+#
+#   # On SLURM:
+#   EXPERIMENT_CONFIG=config/experiment_sub1000.toml \
+#       snakemake -s Snakefile.extend --profile profiles/slurm
+
+import os
+import tomllib
+
+# ---------------------------------------------------------------------------
+# Load experiment config (same TOML as the original run)
+# ---------------------------------------------------------------------------
+
+_cfg_path = os.environ.get("EXPERIMENT_CONFIG", "config/experiment_sub1000.toml")
+
+with open(_cfg_path, "rb") as _f:
+    _cfg = tomllib.load(_f)
+
+EXP_NAME   = _cfg["experiment"]["name"]
+BASE_SEED  = _cfg["experiment"].get("base_seed", 42)
+
+DATA_ROOT             = _cfg["data"]["root"]
+CV_ROOT               = _cfg["data"]["cv_root"]
+DATASETS              = _cfg["data"]["datasets"]
+SUBSAMPLE_N           = _cfg["data"].get("subsample_n", None)
+SUBSAMPLE_SEED_OFFSET = _cfg["data"].get("subsample_seed_offset", 99)
+
+ALL_SPLITTERS = _cfg["splitting"]["methods"]
+RATIOS        = [str(r) for r in _cfg["splitting"].get("ratios", [0.8])]
+REPEATS       = _cfg["splitting"].get("repeats", 5)
+KFOLDS        = _cfg["splitting"].get("k_folds", 5)
+
+MODEL_METHODS = _cfg["models"]["methods"]
+
+OUT_ROOT = os.path.join(_cfg["output"]["root"], EXP_NAME)
+
+REPS  = [str(i) for i in range(1, REPEATS + 1)]
+FOLDS = [str(i) for i in range(1, KFOLDS + 1)]
+
+# ---------------------------------------------------------------------------
+# NEW_SPLITTERS: only the methods not yet present in the existing Arrow files.
+# Edit this list if you are extending with a different subset.
+# ---------------------------------------------------------------------------
+
+NEW_SPLITTERS = [
+    "kmeans_stratified", "kmeans_shuffle",
+    "kmedoids_stratified", "kmedoids_shuffle",
+    "hac_stratified", "hac_shuffle",
+]
+
+# Sanity-check: every new splitter must be in the config's methods list.
+for s in NEW_SPLITTERS:
+    if s not in ALL_SPLITTERS:
+        raise ValueError(
+            f"Splitter '{s}' is in NEW_SPLITTERS but not in the config file "
+            f"({_cfg_path}). Add it to [splitting] methods first."
+        )
+
+_l2            = _cfg.get("layer2", None)
+LAYER2_ENABLED = _l2 is not None
+
+# ---------------------------------------------------------------------------
+# Runtime / memory helpers (same logic as Snakefile.experiment)
+# ---------------------------------------------------------------------------
+
+HEAVY_CHAMPION_DATASETS = {
+    "3A4", "CB1", "DPP4", "HIVINT", "HIVPROT", "LOGD",
+    "METAB", "NK1", "OX1", "OX2", "PGP", "PPB", "TDI", "THROMBIN",
+}
+
+def champion_runtime_minutes(dataset):
+    return 360
+
+def champion_mem_mb(dataset):
+    return 48000 if dataset in HEAVY_CHAMPION_DATASETS else 14000
+
+def gather_mem_mb(dataset):
+    return 32000 if dataset in HEAVY_CHAMPION_DATASETS else 16000
+
+# ---------------------------------------------------------------------------
+# Path helpers (identical convention to Snakefile.experiment)
+# ---------------------------------------------------------------------------
+
+def cv_path(dataset):
+    return os.path.join(CV_ROOT, dataset, "cv", "cv_splits.jld2")
+
+def subsampled_cv_path(dataset, rep, fold):
+    return os.path.join(OUT_ROOT, "subsampled_cv", dataset, f"rep{rep}_fold{fold}.jld2")
+
+def effective_cv_input(dataset, rep, fold):
+    if SUBSAMPLE_N is not None:
+        return subsampled_cv_path(dataset, rep, fold)
+    return cv_path(dataset)
+
+def split_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "splits", dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.jld2",
+    )
+
+def consolidated_split_path(dataset, splitter, ratio):
+    return os.path.join(
+        OUT_ROOT, "splits", dataset, splitter, f"ratio{ratio}", "splits.jld2",
+    )
+
+def shard_path(dataset, model, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "predictions", "shards",
+        dataset, model, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def predictions_path(dataset, model):
+    return os.path.join(OUT_ROOT, "predictions", dataset, f"{model}.arrow")
+
+def ad_annotation_shard_path(dataset, model, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "ad_predictions", "shards",
+        dataset, model, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def ad_annotation_path(dataset, model):
+    return os.path.join(OUT_ROOT, "ad_predictions", dataset, f"{model}.arrow")
+
+def layer1_summary_path(dataset, model):
+    return os.path.join(OUT_ROOT, "layer1_summary", dataset, f"{model}.arrow")
+
+def split_metrics_shard_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "split_metrics", "shards",
+        dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def split_metrics_path(dataset):
+    return os.path.join(OUT_ROOT, "split_metrics", f"{dataset}.arrow")
+
+def champion_shard_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "champion_predictions", "shards",
+        dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def champion_predictions_path(dataset):
+    return os.path.join(OUT_ROOT, "champion_predictions", f"{dataset}.arrow")
+
+def ad_annotation_champion_shard_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "ad_champion", "shards",
+        dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def ad_annotation_champion_path(dataset):
+    return os.path.join(OUT_ROOT, "ad_champion", f"{dataset}.arrow")
+
+# Sentinel files mark that appending has been done for a (dataset, model) pair.
+def extend_sentinel(tag, dataset, model=""):
+    name = f"{dataset}-{model}.extended" if model else f"{dataset}.extended"
+    return os.path.join(OUT_ROOT, "extend_sentinels", tag, name)
+
+# ---------------------------------------------------------------------------
+# Target collections — only for NEW_SPLITTERS
+# ---------------------------------------------------------------------------
+
+NEW_PREDICTION_SHARDS = [
+    shard_path(d, m, s, r, rep, f)
+    for d   in DATASETS
+    for m   in MODEL_METHODS
+    for s   in NEW_SPLITTERS
+    for r   in RATIOS
+    for rep in REPS
+    for f   in FOLDS
+]
+
+ALL_EXTEND_SENTINELS_PREDICTIONS = [
+    extend_sentinel("predictions", d, m)
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+ALL_EXTEND_SENTINELS_AD = [
+    extend_sentinel("ad_predictions", d, m)
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+ALL_EXTEND_SENTINELS_LAYER1 = [
+    extend_sentinel("layer1_summary", d, m)
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+ALL_EXTEND_SENTINELS_SPLIT_METRICS = [
+    extend_sentinel("split_metrics", d)
+    for d in DATASETS
+]
+ALL_EXTEND_SENTINELS_CHAMPION = ([
+    extend_sentinel("champion_predictions", d)
+    for d in DATASETS
+] + [
+    extend_sentinel("ad_champion", d)
+    for d in DATASETS
+]) if LAYER2_ENABLED else []
+
+# ---------------------------------------------------------------------------
+# Wildcard constraints
+# ---------------------------------------------------------------------------
+
+wildcard_constraints:
+    dataset  = r"[^/]+",
+    model    = r"[^/]+",
+    splitter = r"[^/]+",
+    ratio    = r"[^/]+",
+    rep      = r"[^/]+",
+    fold     = r"[^/]+",
+
+# ---------------------------------------------------------------------------
+# all — top-level target
+# ---------------------------------------------------------------------------
+
+rule all:
+    input:
+        ALL_EXTEND_SENTINELS_PREDICTIONS,
+        ALL_EXTEND_SENTINELS_AD,
+        ALL_EXTEND_SENTINELS_LAYER1,
+        ALL_EXTEND_SENTINELS_SPLIT_METRICS,
+        *ALL_EXTEND_SENTINELS_CHAMPION,
+
+
+# ---------------------------------------------------------------------------
+# Step 0: Subsampled CV — regenerate any missing subsampled fold files.
+# The original CV folds (Splits/merck/…/cv_splits.jld2) are permanent; the
+# subsampled files were intermediate and may have been cleaned up after the
+# original run.  Marking the CV source as ancient() skips timestamp checks.
+# ---------------------------------------------------------------------------
+
+if SUBSAMPLE_N is not None:
+    rule subsample_cv:
+        """Draw a reproducible random subsample of one outer-CV fold."""
+        input:
+            cv=ancient(lambda wc: cv_path(wc.dataset)),
+        output:
+            out=os.path.join(OUT_ROOT, "subsampled_cv", "{dataset}", "rep{rep}_fold{fold}.jld2"),
+        params:
+            n=SUBSAMPLE_N,
+            seed=lambda wc: BASE_SEED + SUBSAMPLE_SEED_OFFSET + int(wc.rep) * 1000 + int(wc.fold),
+            cfg=_cfg_path,
+        threads: 1
+        resources:
+            mem_mb=4000,
+            runtime=360,
+            cpus_per_task=1,
+        log:
+            os.path.join(OUT_ROOT, "logs", "subsample_cv", "{dataset}-rep{rep}-fold{fold}.log"),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+            EXPERIMENT_CONFIG="{params.cfg}" \
+            julia --project=. scripts/subsample_cv.jl \
+                "{wildcards.dataset}" "{input.cv}" \
+                "{wildcards.rep}" "{wildcards.fold}" \
+                "{params.n}" "{params.seed}" \
+                "{output.out}" \
+                2>&1 | tee {log}
+            """
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Split — identical to Snakefile.experiment
+# ---------------------------------------------------------------------------
+
+rule split_one:
+    """Apply one new splitting algorithm to one outer-CV (rep, fold)."""
+    input:
+        cv=ancient(lambda wc: effective_cv_input(wc.dataset, wc.rep, wc.fold)),
+    output:
+        out=temp(os.path.join(
+            OUT_ROOT, "splits", "{dataset}", "{splitter}",
+            "ratio{ratio}", "rep{rep}_fold{fold}.jld2",
+        )),
+    params:
+        frac=lambda wc: wc.ratio,
+        seed=lambda wc: BASE_SEED + int(wc.rep) * 1000 + int(wc.fold),
+        cfg=_cfg_path,
+    wildcard_constraints:
+        splitter="|".join(NEW_SPLITTERS),
+    threads: 1
+    resources:
+        mem_mb=lambda wc: 20000,
+        runtime=lambda wc: 3 * 24 * 60 if wc.dataset in {"LOGD", "3A4"} else 360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "splits",
+                     "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        julia --project=. scripts/run_split.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" \
+            "{input.cv}" "{wildcards.rep}" "{wildcards.fold}" \
+            "{output.out}" "{params.frac}" "{params.seed}" \
+            2>&1 | tee {log}
+        """
+
+
+rule consolidate_splits:
+    """Merge per-(rep, fold) split shards for one (dataset, new_splitter, ratio)."""
+    input:
+        shards=lambda wc: [
+            split_path(wc.dataset, wc.splitter, wc.ratio, rep, fold)
+            for rep  in REPS
+            for fold in FOLDS
+        ],
+    output:
+        out=os.path.join(
+            OUT_ROOT, "splits", "{dataset}", "{splitter}",
+            "ratio{ratio}", "splits.jld2",
+        ),
+    wildcard_constraints:
+        splitter="|".join(NEW_SPLITTERS),
+    params:
+        expected=len(REPS) * len(FOLDS),
+    threads: 1
+    resources:
+        mem_mb=4000,
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "consolidate_splits",
+                     "{dataset}-{splitter}-ratio{ratio}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        julia --project=. scripts/consolidate_experiment_splits.jl \
+            --expected {params.expected} "{output.out}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Model predictions
+# ---------------------------------------------------------------------------
+
+rule run_model:
+    """Train one model on one (new_splitter, ratio, rep, fold) split."""
+    input:
+        split=lambda wc: consolidated_split_path(wc.dataset, wc.splitter, wc.ratio),
+    output:
+        shard=os.path.join(
+            OUT_ROOT, "predictions", "shards",
+            "{dataset}", "{model}", "{splitter}", "ratio{ratio}",
+            "rep{rep}_fold{fold}.arrow",
+        ),
+    wildcard_constraints:
+        splitter="|".join(NEW_SPLITTERS),
+    params:
+        cfg=_cfg_path,
+    threads: 4
+    resources:
+        mem_mb=18000,
+        runtime=lambda wc: champion_runtime_minutes(wc.dataset),
+        cpus_per_task=4,
+    log:
+        os.path.join(OUT_ROOT, "logs", "predictions",
+                     "{dataset}-{model}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        julia --threads {threads} --project=. scripts/run_model.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+            "{wildcards.model}" "{wildcards.rep}" "{wildcards.fold}" \
+            "{input.split}" "{output.shard}" \
+            2>&1 | tee {log}
+        """
+
+
+rule extend_predictions:
+    """Append new-splitter prediction shards to the existing gathered Arrow file."""
+    input:
+        existing=ancient(lambda wc: predictions_path(wc.dataset, wc.model)),
+        shards=lambda wc: [
+            shard_path(wc.dataset, wc.model, s, r, rep, f)
+            for s   in NEW_SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        sentinel=extend_sentinel("predictions", "{dataset}", "{model}"),
+    log:
+        os.path.join(OUT_ROOT, "logs", "extend", "predictions-{dataset}-{model}.log"),
+    threads: 1
+    resources:
+        mem_mb=lambda wc: gather_mem_mb(wc.dataset),
+        runtime=360,
+        cpus_per_task=1,
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.sentinel})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        julia --project=. scripts/append_to_arrow.jl \
+            "{input.existing}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        touch "{output.sentinel}"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 3: AD annotation
+# ---------------------------------------------------------------------------
+
+rule run_ad_annotation:
+    """Fit AD and annotate new-splitter predictions."""
+    input:
+        split       = lambda wc: consolidated_split_path(wc.dataset, wc.splitter, wc.ratio),
+        predictions = lambda wc: shard_path(
+            wc.dataset, wc.model, wc.splitter, wc.ratio, wc.rep, wc.fold
+        ),
+    output:
+        shard=temp(os.path.join(
+            OUT_ROOT, "ad_predictions", "shards",
+            "{dataset}", "{model}", "{splitter}", "ratio{ratio}",
+            "rep{rep}_fold{fold}.arrow",
+        )),
+    wildcard_constraints:
+        splitter="|".join(NEW_SPLITTERS),
+    params:
+        cfg=_cfg_path,
+    threads: 1
+    resources:
+        mem_mb=6000,
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "layer3",
+                     "{dataset}-{model}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        julia --project=. scripts/run_ad_annotation.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+            "{wildcards.rep}" "{wildcards.fold}" \
+            "{input.split}" "{input.predictions}" "{output.shard}" \
+            2>&1 | tee {log}
+        """
+
+
+rule extend_ad_predictions:
+    """Append new-splitter AD annotation shards to the existing Arrow file."""
+    input:
+        existing=ancient(lambda wc: ad_annotation_path(wc.dataset, wc.model)),
+        shards=lambda wc: [
+            ad_annotation_shard_path(wc.dataset, wc.model, s, r, rep, f)
+            for s   in NEW_SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        sentinel=extend_sentinel("ad_predictions", "{dataset}", "{model}"),
+    log:
+        os.path.join(OUT_ROOT, "logs", "extend", "ad_predictions-{dataset}-{model}.log"),
+    threads: 1
+    resources:
+        mem_mb=6000,
+        runtime=360,
+        cpus_per_task=1,
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.sentinel})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        julia --project=. scripts/append_to_arrow.jl \
+            "{input.existing}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        touch "{output.sentinel}"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Layer 1 summary (RMSE / R2 / bias)
+# aggregate_layer1.jl computes metrics from raw prediction shards, so we
+# first produce a temp summary for the new splitters, then append it to the
+# existing gathered layer1 Arrow.
+# ---------------------------------------------------------------------------
+
+def new_layer1_path(dataset, model):
+    return os.path.join(OUT_ROOT, "layer1_summary", "new_splitters", dataset, f"{model}.arrow")
+
+rule aggregate_new_layer1:
+    """Compute layer1 summary metrics for the new splitters only."""
+    input:
+        shards=lambda wc: [
+            shard_path(wc.dataset, wc.model, s, r, rep, f)
+            for s   in NEW_SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        out=new_layer1_path("{dataset}", "{model}"),
+    log:
+        os.path.join(OUT_ROOT, "logs", "extend", "aggregate_layer1-{dataset}-{model}.log"),
+    threads: 1
+    resources:
+        mem_mb=lambda wc: champion_mem_mb(wc.dataset),
+        runtime=360,
+        cpus_per_task=1,
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        julia --project=. scripts/aggregate_layer1.jl \
+            "{output.out}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        """
+
+
+rule extend_layer1:
+    """Append the new-splitter layer1 summary to the existing Arrow file."""
+    input:
+        existing=ancient(lambda wc: layer1_summary_path(wc.dataset, wc.model)),
+        new=new_layer1_path("{dataset}", "{model}"),
+    output:
+        sentinel=extend_sentinel("layer1_summary", "{dataset}", "{model}"),
+    log:
+        os.path.join(OUT_ROOT, "logs", "extend", "layer1-{dataset}-{model}.log"),
+    threads: 1
+    resources:
+        mem_mb=lambda wc: champion_mem_mb(wc.dataset),
+        runtime=360,
+        cpus_per_task=1,
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.sentinel})" "$(dirname {log})"
+        julia --project=. scripts/append_to_arrow.jl \
+            "{input.existing}" "{input.new}" \
+            2>&1 | tee {log}
+        touch "{output.sentinel}"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Distribution-shift metrics
+# ---------------------------------------------------------------------------
+
+rule compute_split_metrics_one:
+    """Compute distribution-shift metrics for one new-splitter split."""
+    input:
+        split=lambda wc: consolidated_split_path(wc.dataset, wc.splitter, wc.ratio),
+    output:
+        shard=temp(os.path.join(
+            OUT_ROOT, "split_metrics", "shards",
+            "{dataset}", "{splitter}", "ratio{ratio}",
+            "rep{rep}_fold{fold}.arrow",
+        )),
+    wildcard_constraints:
+        splitter="|".join(NEW_SPLITTERS),
+    params:
+        cfg=_cfg_path,
+    threads: 1
+    resources:
+        mem_mb=8000,
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "split_metrics",
+                     "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        julia --project=. scripts/compute_split_metrics.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+            "{wildcards.rep}" "{wildcards.fold}" \
+            "{input.split}" "{output.shard}" \
+            2>&1 | tee {log}
+        """
+
+
+rule extend_split_metrics:
+    """Append new-splitter split-metric shards to the existing Arrow file."""
+    input:
+        existing=ancient(lambda wc: split_metrics_path(wc.dataset)),
+        shards=lambda wc: [
+            split_metrics_shard_path(wc.dataset, s, r, rep, f)
+            for s   in NEW_SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        sentinel=extend_sentinel("split_metrics", "{dataset}"),
+    log:
+        os.path.join(OUT_ROOT, "logs", "extend", "split_metrics-{dataset}.log"),
+    threads: 1
+    resources:
+        mem_mb=4000,
+        runtime=360,
+        cpus_per_task=1,
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.sentinel})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        julia --project=. scripts/append_to_arrow.jl \
+            "{input.existing}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        touch "{output.sentinel}"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Champion model selection (layer 2) — conditional
+# ---------------------------------------------------------------------------
+
+if LAYER2_ENABLED:
+
+    rule run_model_selection:
+        """TPE champion selection for one new-splitter (rep, fold) split."""
+        input:
+            split=lambda wc: consolidated_split_path(wc.dataset, wc.splitter, wc.ratio),
+        output:
+            shard=os.path.join(
+                OUT_ROOT, "champion_predictions", "shards",
+                "{dataset}", "{splitter}", "ratio{ratio}",
+                "rep{rep}_fold{fold}.arrow",
+            ),
+        wildcard_constraints:
+            splitter="|".join(NEW_SPLITTERS),
+        params:
+            cfg=_cfg_path,
+        threads: 10
+        resources:
+            mem_mb=lambda wc: champion_mem_mb(wc.dataset),
+            runtime=lambda wc: champion_runtime_minutes(wc.dataset),
+            cpus_per_task=10,
+        log:
+            os.path.join(OUT_ROOT, "logs", "champion",
+                         "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log"),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+            EXPERIMENT_CONFIG="{params.cfg}" \
+            julia --threads {threads} --project=. scripts/run_model_selection.jl \
+                "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+                "{wildcards.rep}" "{wildcards.fold}" \
+                "{input.split}" "{output.shard}" \
+                2>&1 | tee {log}
+            """
+
+    rule run_ad_annotation_champion:
+        """AD annotation for new-splitter champion predictions."""
+        input:
+            split           = lambda wc: consolidated_split_path(wc.dataset, wc.splitter, wc.ratio),
+            model_selection = lambda wc: champion_shard_path(
+                wc.dataset, wc.splitter, wc.ratio, wc.rep, wc.fold
+            ),
+        output:
+            shard=temp(os.path.join(
+                OUT_ROOT, "ad_champion", "shards",
+                "{dataset}", "{splitter}", "ratio{ratio}",
+                "rep{rep}_fold{fold}.arrow",
+            )),
+        wildcard_constraints:
+            splitter="|".join(NEW_SPLITTERS),
+        params:
+            cfg=_cfg_path,
+        threads: 1
+        resources:
+            mem_mb=6000,
+            runtime=360,
+            cpus_per_task=1,
+        log:
+            os.path.join(OUT_ROOT, "logs", "ad_champion",
+                         "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log"),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+            EXPERIMENT_CONFIG="{params.cfg}" \
+            julia --project=. scripts/run_ad_annotation.jl \
+                "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+                "{wildcards.rep}" "{wildcards.fold}" \
+                "{input.split}" "{input.model_selection}" "{output.shard}" \
+                2>&1 | tee {log}
+            """
+
+    rule extend_champion_predictions:
+        """Append new-splitter champion shards to the existing Arrow file."""
+        input:
+            existing=ancient(lambda wc: champion_predictions_path(wc.dataset)),
+            shards=lambda wc: [
+                champion_shard_path(wc.dataset, s, r, rep, f)
+                for s   in NEW_SPLITTERS
+                for r   in RATIOS
+                for rep in REPS
+                for f   in FOLDS
+            ],
+        output:
+            sentinel=extend_sentinel("champion_predictions", "{dataset}"),
+        log:
+            os.path.join(OUT_ROOT, "logs", "extend", "champion-{dataset}.log"),
+        threads: 1
+        resources:
+            mem_mb=lambda wc: gather_mem_mb(wc.dataset),
+            runtime=360,
+            cpus_per_task=1,
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.sentinel})" "$(dirname {log})"
+            SLIST=$(mktemp --suffix=.shardlist)
+            printf '%s\n' {input.shards} > "$SLIST"
+            julia --project=. scripts/append_to_arrow.jl \
+                "{input.existing}" "@$SLIST" \
+                2>&1 | tee {log}
+            rm -f "$SLIST"
+            touch "{output.sentinel}"
+            """
+
+    rule extend_ad_champion:
+        """Append new-splitter AD-champion shards to the existing Arrow file."""
+        input:
+            existing=ancient(lambda wc: ad_annotation_champion_path(wc.dataset)),
+            shards=lambda wc: [
+                ad_annotation_champion_shard_path(wc.dataset, s, r, rep, f)
+                for s   in NEW_SPLITTERS
+                for r   in RATIOS
+                for rep in REPS
+                for f   in FOLDS
+            ],
+        output:
+            sentinel=extend_sentinel("ad_champion", "{dataset}"),
+        log:
+            os.path.join(OUT_ROOT, "logs", "extend", "ad_champion-{dataset}.log"),
+        threads: 1
+        resources:
+            mem_mb=lambda wc: gather_mem_mb(wc.dataset),
+            runtime=360,
+            cpus_per_task=1,
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.sentinel})" "$(dirname {log})"
+            SLIST=$(mktemp --suffix=.shardlist)
+            printf '%s\n' {input.shards} > "$SLIST"
+            julia --project=. scripts/append_to_arrow.jl \
+                "{input.existing}" "@$SLIST" \
+                2>&1 | tee {log}
+            rm -f "$SLIST"
+            touch "{output.sentinel}"
+            """

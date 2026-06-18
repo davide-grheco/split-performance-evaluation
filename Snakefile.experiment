@@ -1,0 +1,960 @@
+# Snakefile.experiment — unified workflow driven by a TOML experiment config.
+#
+# Usage:
+#   EXPERIMENT_CONFIG=config/experiment.toml snakemake -s Snakefile.experiment --cores 8
+#   EXPERIMENT_CONFIG=config/experiment.toml snakemake -s Snakefile.experiment --profile profiles/slurm
+#
+# The EXPERIMENT_CONFIG env var must point to a TOML file following the
+# template in config/experiment.toml.  All parameters (datasets, splitters,
+# repeats, folds, frac, output root, …) are read from that file; nothing is
+# hard-coded here.
+
+import os
+import tomllib  # Python 3.11+; fall back to tomli if needed
+
+# Use --compiled-modules=existing so worker jobs never write a precompile
+# pidfile. Without this, all nodes block on the one node that wins the race
+# to recompile — cross-node pid checks always fail, so they wait forever.
+#
+# JULIA_CONDAPKG_BACKEND=Null skips CondaPkg's resolve() entirely (including
+# its Pidfile lock), which is the only reliable way to avoid 50-minute lock
+# waits when hundreds of workers start simultaneously on Lustre.
+# JULIA_CONDAPKG_OFFLINE=true alone is insufficient: the lock is acquired
+# before the offline check fires (CondaPkg.jl issue #153 / PR #155).
+# JULIA_PYTHONCALL_EXE points PythonCall directly at the pre-built pixi env
+# so it never calls envdir(), which would raise an error under the Null backend.
+# The conda env must be resolved beforehand via precompile.slurm.
+CONDAPKG_PYTHON = "$(pwd)/.CondaPkg/.pixi/envs/default/bin/python"
+JULIA = f"JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE={CONDAPKG_PYTHON} julia --compiled-modules=existing"
+
+# ---------------------------------------------------------------------------
+# Load experiment config
+# ---------------------------------------------------------------------------
+
+_cfg_path = os.environ.get("EXPERIMENT_CONFIG", "config/experiment.toml")
+
+try:
+    with open(_cfg_path, "rb") as _f:
+        _cfg = tomllib.load(_f)
+except AttributeError:
+    try:
+        import tomli as tomllib
+        with open(_cfg_path, "rb") as _f:
+            _cfg = tomllib.load(_f)
+    except ImportError:
+        raise RuntimeError(
+            "Python 3.11+ (tomllib) or the 'tomli' package is required. "
+            "Install with: pip install tomli"
+        )
+
+EXP_NAME   = _cfg["experiment"]["name"]
+BASE_SEED  = _cfg["experiment"].get("base_seed", 42)
+
+DATA_ROOT             = _cfg["data"]["root"]
+CV_ROOT               = _cfg["data"]["cv_root"]
+DATASETS              = _cfg["data"]["datasets"]
+SUBSAMPLE_N           = _cfg["data"].get("subsample_n", None)
+SUBSAMPLE_SEED_OFFSET = _cfg["data"].get("subsample_seed_offset", 99)
+
+SPLITTERS  = _cfg["splitting"]["methods"]
+RATIOS     = [str(r) for r in _cfg["splitting"].get("ratios", [_cfg["splitting"].get("frac", 0.8)])]
+REPEATS    = _cfg["splitting"].get("repeats", 5)
+KFOLDS     = _cfg["splitting"].get("k_folds", 5)
+
+MODEL_METHODS = _cfg["models"]["methods"]
+
+OUT_ROOT   = os.path.join(_cfg["output"]["root"], EXP_NAME)
+
+REPS  = [str(i) for i in range(1, REPEATS + 1)]
+FOLDS = [str(i) for i in range(1, KFOLDS + 1)]
+
+# Empirical runtime data from experiments/revision_v1/benchmarks/champion shows
+# that only a subset of datasets regularly crosses the 6h short-queue ceiling.
+# Keep the common case at 6h, and only ask for a longer walltime on the proven
+# heavy datasets. CESGA will map the job to the appropriate queue automatically
+# from the requested time.
+HEAVY_CHAMPION_DATASETS = {
+    "3A4",    # 0/225 champion benchmarks completed — systematic timeout
+    "CB1",    # max observed 355 min / 360 min limit (98.6%)
+    "DPP4",
+    "HIVINT",
+    "HIVPROT",
+    "LOGD",   # 0/225 champion benchmarks completed — systematic timeout
+    "METAB",  # OOM at 14 GB (kennardstone, butina)
+    "NK1",
+    "OX1",
+    "OX2",    # only 7/225 completed; max 316 min suggests most timed out
+    "PGP",
+    "PPB",
+    "RAT_F",   # OOM at 14 GB (spxy-jaccard)
+    "TDI",
+    "THROMBIN",  # OOM at 14 GB (optisim, minimum_dissimilarity)
+}
+
+LONG_CHAMPION_DATASETS = {"3A4",  "LOGD"}
+def champion_runtime_minutes(dataset):
+    return 4320 if dataset in LONG_CHAMPION_DATASETS else 360
+
+def champion_mem_mb(dataset):
+    if dataset in LONG_CHAMPION_DATASETS:
+        return 142000
+    # 32 GB was insufficient for heavy datasets with memory-intensive splitters
+    # (spxy-jaccard, kennardstone, optisim, mdks, etc.) — bumped to 48 GB
+    return 48000 if dataset in HEAVY_CHAMPION_DATASETS else 14000
+
+def gather_mem_mb(dataset):
+    return 32000 if dataset in HEAVY_CHAMPION_DATASETS else 16000
+
+# Layer 2 (champion selection) — optional; enabled when [layer2] is present in config
+_l2             = _cfg.get("layer2", None)
+LAYER2_ENABLED  = _l2 is not None
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def cv_path(dataset):
+    return os.path.join(CV_ROOT, dataset, "cv", "cv_splits.jld2")
+
+def subsampled_cv_path(dataset, rep, fold):
+    return os.path.join(OUT_ROOT, "subsampled_cv", dataset, f"rep{rep}_fold{fold}.jld2")
+
+def effective_cv_input(dataset, rep, fold):
+    """Return the cv input path for split_one: subsampled when configured, full otherwise."""
+    if SUBSAMPLE_N is not None:
+        return subsampled_cv_path(dataset, rep, fold)
+    return cv_path(dataset)
+
+def split_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "splits", dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.jld2",
+    )
+
+def consolidated_split_path(dataset, splitter, ratio):
+    return os.path.join(
+        OUT_ROOT, "splits", dataset, splitter, f"ratio{ratio}",
+        "splits.jld2",
+    )
+
+def shard_path(dataset, model, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "predictions", "shards",
+        dataset, model, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def predictions_path(dataset, model):
+    return os.path.join(OUT_ROOT, "predictions", dataset, f"{model}.arrow")
+
+def ad_annotation_shard_path(dataset, model, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "ad_predictions", "shards",
+        dataset, model, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def ad_annotation_path(dataset, model):
+    return os.path.join(OUT_ROOT, "ad_predictions", dataset, f"{model}.arrow")
+
+def layer1_summary_path(dataset, model):
+    return os.path.join(OUT_ROOT, "layer1_summary", dataset, f"{model}.arrow")
+
+def split_metrics_shard_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "split_metrics", "shards",
+        dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def split_metrics_path(dataset):
+    return os.path.join(OUT_ROOT, "split_metrics", f"{dataset}.arrow")
+
+def champion_shard_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "champion_predictions", "shards",
+        dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def champion_predictions_path(dataset):
+    return os.path.join(OUT_ROOT, "champion_predictions", f"{dataset}.arrow")
+
+def ad_annotation_champion_shard_path(dataset, splitter, ratio, rep, fold):
+    return os.path.join(
+        OUT_ROOT, "ad_champion", "shards",
+        dataset, splitter, f"ratio{ratio}",
+        f"rep{rep}_fold{fold}.arrow",
+    )
+
+def ad_annotation_champion_path(dataset):
+    return os.path.join(OUT_ROOT, "ad_champion", f"{dataset}.arrow")
+
+# ---------------------------------------------------------------------------
+# Target collections
+# ---------------------------------------------------------------------------
+
+ALL_SPLITS = [
+    split_path(d, s, r, rep, f)
+    for d   in DATASETS
+    for s   in SPLITTERS
+    for r   in RATIOS
+    for rep in REPS
+    for f   in FOLDS
+]
+
+ALL_PREDICTIONS = [
+    predictions_path(d, m)
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+
+ALL_AD_PREDICTIONS = [
+    ad_annotation_path(d, m)
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+
+ALL_LAYER1_SUMMARIES = [
+    layer1_summary_path(d, m)
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+
+ALL_SPLIT_METRICS = [split_metrics_path(d) for d in DATASETS]
+
+ALL_CHAMPION_PREDICTIONS = [
+    champion_predictions_path(d)
+    for d in DATASETS
+] if LAYER2_ENABLED else []
+
+ALL_CHAMPION_AD = [
+    ad_annotation_champion_path(d)
+    for d in DATASETS
+] if LAYER2_ENABLED else []
+
+# ---------------------------------------------------------------------------
+# Wildcard constraints — prevent wildcards from matching path separators,
+# which would cause PeriodicWildcardError via recursive DAG expansion.
+# ---------------------------------------------------------------------------
+
+wildcard_constraints:
+    dataset  = r"[^/]+",
+    model    = r"[^/]+",
+    splitter = r"[^/]+",
+    ratio    = r"[^/]+",
+    rep      = r"[^/]+",
+    fold     = r"[^/]+",
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+ALL_BENCHMARK_ARROWS = [
+    os.path.join(OUT_ROOT, "benchmarks", f"{name}.arrow")
+    for name in (
+        ["splits", "predictions", "layer3", "split_metrics"]
+        + (["champion", "ad_champion"] if LAYER2_ENABLED else [])
+    )
+]
+
+ALL_SHARD_CLEANUP_SENTINELS = [
+    os.path.join(OUT_ROOT, "predictions", "shards", d, m, ".cleaned")
+    for d in DATASETS
+    for m in MODEL_METHODS
+]
+ALL_CHAMPION_CLEANUP_SENTINELS = [
+    os.path.join(OUT_ROOT, "champion_predictions", "shards", d, ".cleaned")
+    for d in DATASETS
+] if LAYER2_ENABLED else []
+
+rule all:
+    input:
+        ALL_PREDICTIONS,
+        ALL_AD_PREDICTIONS,
+        ALL_LAYER1_SUMMARIES,
+        ALL_SPLIT_METRICS,
+        *ALL_CHAMPION_PREDICTIONS,
+        *ALL_CHAMPION_AD,
+        *ALL_BENCHMARK_ARROWS,
+        *ALL_SHARD_CLEANUP_SENTINELS,
+        *ALL_CHAMPION_CLEANUP_SENTINELS,
+
+
+if SUBSAMPLE_N is not None:
+    rule subsample_cv:
+        """Draw a reproducible random subsample of one outer-CV fold.
+
+        Runs once per (dataset, rep, fold); the saved index file is shared by
+        all splitters so every method sees exactly the same compounds.
+        """
+        input:
+            cv=ancient(lambda wc: cv_path(wc.dataset)),
+        output:
+            out=os.path.join(OUT_ROOT, "subsampled_cv", "{dataset}", "rep{rep}_fold{fold}.jld2"),
+        params:
+            n=SUBSAMPLE_N,
+            seed=lambda wc: BASE_SEED + SUBSAMPLE_SEED_OFFSET + int(wc.rep) * 1000 + int(wc.fold),
+            cfg=_cfg_path,
+        threads: 1
+        resources:
+            mem_mb=4000,
+            runtime=360,
+            cpus_per_task=1,
+        log:
+            os.path.join(OUT_ROOT, "logs", "subsample_cv", "{dataset}-rep{rep}-fold{fold}.log"),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+            EXPERIMENT_CONFIG="{params.cfg}" \
+            JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/subsample_cv.jl \
+                "{wildcards.dataset}" "{input.cv}" \
+                "{wildcards.rep}" "{wildcards.fold}" \
+                "{params.n}" "{params.seed}" \
+                "{output.out}" \
+                2>&1 | tee {log}
+            """
+
+
+rule split_one:
+    """Apply one splitting algorithm to one outer-CV (rep, fold) at a given ratio."""
+    input:
+        cv=ancient(lambda wc: effective_cv_input(wc.dataset, wc.rep, wc.fold)),
+    output:
+        out=temp(os.path.join(
+            OUT_ROOT, "splits", "{dataset}", "{splitter}",
+            "ratio{ratio}", "rep{rep}_fold{fold}.jld2",
+        )),
+    params:
+        frac=lambda wc: wc.ratio,
+        seed=lambda wc: BASE_SEED + int(wc.rep) * 1000 + int(wc.fold),
+        cfg=_cfg_path,
+    threads: 1
+    resources:
+        # LOGD/3A4 need extra memory (Mahalanobis full distance matrix ~7 GB + overhead)
+        # and long runtime for O(N²) splitters (maximum_dissimilarity, mdks).
+        mem_mb=lambda wc: 60000 if wc.dataset in {"LOGD", "3A4"} else 20000,
+        runtime=lambda wc: 7 * 24 * 60 if (wc.dataset in {"LOGD", "3A4"} and wc.splitter == "maximum_dissimilarity") else (3 * 24 * 60 if wc.dataset in {"LOGD", "3A4"} else 360),
+        cpus_per_task=1,
+    benchmark:
+        os.path.join(
+            OUT_ROOT, "benchmarks", "splits",
+            "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.tsv",
+        ),
+    log:
+        os.path.join(
+            OUT_ROOT, "logs", "splits",
+            "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+        ),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/run_split.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" \
+            "{input.cv}" "{wildcards.rep}" "{wildcards.fold}" \
+            "{output.out}" "{params.frac}" "{params.seed}" \
+            2>&1 | tee {log}
+        """
+
+
+rule consolidate_splits:
+    """Merge all per-(rep, fold) split shards for one (dataset, splitter, ratio) into a single JLD2."""
+    input:
+        shards=lambda wc: [
+            split_path(wc.dataset, wc.splitter, wc.ratio, rep, fold)
+            for rep  in REPS
+            for fold in FOLDS
+        ],
+    output:
+        out=os.path.join(
+            OUT_ROOT, "splits", "{dataset}", "{splitter}",
+            "ratio{ratio}", "splits.jld2",
+        ),
+    params:
+        expected=len(REPS) * len(FOLDS),
+    threads: 1
+    resources:
+        mem_mb=4000,
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "consolidate_splits",
+                     "{dataset}-{splitter}-ratio{ratio}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/consolidate_experiment_splits.jl \
+            --expected {params.expected} "{output.out}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        """
+
+
+rule run_model:
+    """Train one model on one (splitter, ratio, rep, fold) split and write a prediction shard."""
+    input:
+        split=ancient(lambda wc: consolidated_split_path(
+            wc.dataset, wc.splitter, wc.ratio
+        )),
+    output:
+        shard=os.path.join(
+            OUT_ROOT, "predictions", "shards",
+            "{dataset}", "{model}", "{splitter}", "ratio{ratio}",
+            "rep{rep}_fold{fold}.arrow",
+        ),
+    params:
+        cfg=_cfg_path,
+    # Empirical benchmark data shows these jobs use ~1.6 effective CPU cores on
+    # average and stay below ~2.8 cores at p95, so 10 requested CPUs wastes HPC
+    # capacity without improving throughput under a job-count QoS cap.
+    threads: 4
+    resources:
+        # Empirical benchmark: max=27.4 GB (3A4/LOGD × LightGBM).
+        # Groups of 2 run sequentially → SLURM ceiling = 2×18000=36 GB; 31% buffer.
+        mem_mb=18000,
+        runtime=lambda wc: champion_runtime_minutes(wc.dataset),
+        cpus_per_task=4,
+    benchmark:
+        os.path.join(
+            OUT_ROOT, "benchmarks", "predictions",
+            "{dataset}-{model}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.tsv",
+        ),
+    log:
+        os.path.join(
+            OUT_ROOT, "logs", "predictions",
+            "{dataset}-{model}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+        ),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --threads {threads} --project=. scripts/run_model.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+            "{wildcards.model}" "{wildcards.rep}" "{wildcards.fold}" \
+            "{input.split}" "{output.shard}" \
+            2>&1 | tee {log}
+        """
+
+
+rule gather_predictions:
+    """Concatenate all shards for one (dataset, model) into a single Arrow file."""
+    input:
+        shards=lambda wc: [
+            shard_path(wc.dataset, wc.model, s, r, rep, f)
+            for s   in SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        out=os.path.join(OUT_ROOT, "predictions", "{dataset}", "{model}.arrow"),
+    threads: 1
+    resources:
+        mem_mb=lambda wc: gather_mem_mb(wc.dataset),
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "gather", "{dataset}-{model}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_predictions.jl \
+            "{output.out}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        """
+
+
+rule run_ad_annotation:
+    """Fit AD on train set, score test + IPS, annotate model predictions."""
+    input:
+        split       = ancient(lambda wc: consolidated_split_path(
+            wc.dataset, wc.splitter, wc.ratio
+        )),
+        predictions = lambda wc: shard_path(
+            wc.dataset, wc.model, wc.splitter, wc.ratio, wc.rep, wc.fold
+        ),
+    output:
+        shard=temp(os.path.join(
+            OUT_ROOT, "ad_predictions", "shards",
+            "{dataset}", "{model}", "{splitter}", "ratio{ratio}",
+            "rep{rep}_fold{fold}.arrow",
+        )),
+    params:
+        cfg=_cfg_path,
+    threads: 1
+    resources:
+        mem_mb=6000,
+        runtime=360,
+        cpus_per_task=1,
+    benchmark:
+        os.path.join(
+            OUT_ROOT, "benchmarks", "layer3",
+            "{dataset}-{model}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.tsv",
+        ),
+    log:
+        os.path.join(
+            OUT_ROOT, "logs", "layer3",
+            "{dataset}-{model}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+        ),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/run_ad_annotation.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+            "{wildcards.rep}" "{wildcards.fold}" \
+            "{input.split}" "{input.predictions}" "{output.shard}" \
+            2>&1 | tee {log}
+        """
+
+
+rule gather_ad_annotation:
+    """Concatenate all AD-annotated shards for one (dataset, model) into a single Arrow file, then delete shards."""
+    input:
+        shards=lambda wc: [
+            ad_annotation_shard_path(wc.dataset, wc.model, s, r, rep, f)
+            for s   in SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        out=os.path.join(OUT_ROOT, "ad_predictions", "{dataset}", "{model}.arrow"),
+    threads: 1
+    resources:
+        mem_mb=6000,
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "gather", "{dataset}-{model}-ad.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_predictions.jl \
+            "{output.out}" "@$SLIST" \
+            2>&1 | tee -a {log} && \
+        rm -f "$SLIST"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Layer 1 summary — per-fold RMSE / R2 / bias
+# ---------------------------------------------------------------------------
+
+rule aggregate_layer1:
+    """Compute per-(splitter, rep, fold) RMSE/R2/bias summary from Layer 1 raw prediction shards."""
+    input:
+        shards=lambda wc: [
+            shard_path(wc.dataset, wc.model, s, r, rep, f)
+            for s   in SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        out=os.path.join(OUT_ROOT, "layer1_summary", "{dataset}", "{model}.arrow"),
+    threads: 1
+    resources:
+        mem_mb=lambda wc: champion_mem_mb(wc.dataset),
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "layer1_summary", "{dataset}-{model}.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/aggregate_layer1.jl \
+            "{output.out}" "@$SLIST" \
+            2>&1 | tee {log}
+        rm -f "$SLIST"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Distribution-shift metri<cs (per split)
+# ---------------------------------------------------------------------------
+
+rule compute_split_metrics_one:
+    """Compute Mahalanobis / sparsity-gap / coverage shift metrics for one split."""
+    input:
+        split=ancient(lambda wc: consolidated_split_path(
+            wc.dataset, wc.splitter, wc.ratio
+        )),
+    output:
+        shard=temp(os.path.join(
+            OUT_ROOT, "split_metrics", "shards",
+            "{dataset}", "{splitter}", "ratio{ratio}",
+            "rep{rep}_fold{fold}.arrow",
+        )),
+    params:
+        cfg=_cfg_path,
+    threads: 1
+    resources:
+        mem_mb=8000,
+        runtime=360,
+        cpus_per_task=1,
+    benchmark:
+        os.path.join(
+            OUT_ROOT, "benchmarks", "split_metrics",
+            "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.tsv",
+        ),
+    log:
+        os.path.join(
+            OUT_ROOT, "logs", "split_metrics",
+            "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+        ),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+        EXPERIMENT_CONFIG="{params.cfg}" \
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/compute_split_metrics.jl \
+            "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+            "{wildcards.rep}" "{wildcards.fold}" \
+            "{input.split}" "{output.shard}" \
+            2>&1 | tee {log}
+        """
+
+
+rule gather_split_metrics:
+    """Concatenate all distribution-shift metric shards for one dataset, then delete shards."""
+    input:
+        shards=lambda wc: [
+            split_metrics_shard_path(wc.dataset, s, r, rep, f)
+            for s   in SPLITTERS
+            for r   in RATIOS
+            for rep in REPS
+            for f   in FOLDS
+        ],
+    output:
+        out=os.path.join(OUT_ROOT, "split_metrics", "{dataset}.arrow"),
+    threads: 1
+    resources:
+        mem_mb=4000,
+        runtime=360,
+        cpus_per_task=1,
+    log:
+        os.path.join(OUT_ROOT, "logs", "split_metrics", "{dataset}-gather.log"),
+    shell:
+        r"""
+        mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+        SLIST=$(mktemp --suffix=.shardlist)
+        printf '%s\n' {input.shards} > "$SLIST"
+        JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_predictions.jl \
+            "{output.out}" "@$SLIST" \
+            2>&1 | tee -a {log} && \
+        rm -f "$SLIST"
+        """
+
+
+# ---------------------------------------------------------------------------
+# Champion model selection (conditional on [layer2] in config)
+# ---------------------------------------------------------------------------
+
+if LAYER2_ENABLED:
+
+    rule run_model_selection:
+        """TPE champion selection across all model candidates for one (splitter, rep, fold) split."""
+        input:
+            split=ancient(lambda wc: consolidated_split_path(
+                wc.dataset, wc.splitter, wc.ratio
+            )),
+        output:
+            shard=os.path.join(
+                OUT_ROOT, "champion_predictions", "shards",
+                "{dataset}", "{splitter}", "ratio{ratio}",
+                "rep{rep}_fold{fold}.arrow",
+            ),
+        params:
+            cfg=_cfg_path,
+        threads: 10
+        resources:
+            # Light datasets: max=10.7 GB RSS across 403 completed jobs; 14 GB gives 31% buffer.
+            # Heavy datasets (3A4/LOGD/OX2/…): run_model peaks at 27.4 GB for LOGD×LightGBM;
+            # 32 GB gives headroom for 5-candidate TPE on the same large datasets.
+            # 10 threads: CPUThreads() runs all inner CV folds in parallel (5 folds × 2 LightGBM
+            # threads each = 10 CPUs), roughly 2× faster wall time vs. the old sequential setup.
+            mem_mb=lambda wc: champion_mem_mb(wc.dataset),
+            runtime=lambda wc: champion_runtime_minutes(wc.dataset),
+            cpus_per_task=10,
+        benchmark:
+            os.path.join(
+                OUT_ROOT, "benchmarks", "champion",
+                "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.tsv",
+            ),
+        log:
+            os.path.join(
+                OUT_ROOT, "logs", "champion",
+                "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+            ),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+            EXPERIMENT_CONFIG="{params.cfg}" \
+            JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --threads {threads} --project=. scripts/run_model_selection.jl \
+                "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+                "{wildcards.rep}" "{wildcards.fold}" \
+                "{input.split}" "{output.shard}" \
+                2>&1 | tee {log}
+            """
+
+    rule gather_model_selection:
+        """Concatenate all champion prediction shards for one dataset."""
+        input:
+            shards=lambda wc: [
+                champion_shard_path(wc.dataset, s, r, rep, f)
+                for s   in SPLITTERS
+                for r   in RATIOS
+                for rep in REPS
+                for f   in FOLDS
+            ],
+        output:
+            out=os.path.join(OUT_ROOT, "champion_predictions", "{dataset}.arrow"),
+        threads: 1
+        resources:
+            mem_mb=lambda wc: gather_mem_mb(wc.dataset),
+            runtime=360,
+            cpus_per_task=1,
+        log:
+            os.path.join(OUT_ROOT, "logs", "gather", "{dataset}-champion.log"),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+            SLIST=$(mktemp --suffix=.shardlist)
+            printf '%s\n' {input.shards} > "$SLIST"
+            JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_predictions.jl \
+                "{output.out}" "@$SLIST" \
+                2>&1 | tee {log}
+            rm -f "$SLIST"
+            """
+
+    rule run_ad_annotation_champion:
+        """Fit AD on training set; annotate model-selection predictions with AD scores."""
+        input:
+            split             = ancient(lambda wc: consolidated_split_path(
+                wc.dataset, wc.splitter, wc.ratio
+            )),
+            model_selection   = lambda wc: champion_shard_path(
+                wc.dataset, wc.splitter, wc.ratio, wc.rep, wc.fold
+            ),
+        output:
+            shard=temp(os.path.join(
+                OUT_ROOT, "ad_champion", "shards",
+                "{dataset}", "{splitter}", "ratio{ratio}",
+                "rep{rep}_fold{fold}.arrow",
+            )),
+        params:
+            cfg=_cfg_path,
+        threads: 1
+        resources:
+            mem_mb=6000,
+            runtime=360,
+            cpus_per_task=1,
+        benchmark:
+            os.path.join(
+                OUT_ROOT, "benchmarks", "ad_champion",
+                "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.tsv",
+            ),
+        log:
+            os.path.join(
+                OUT_ROOT, "logs", "ad_champion",
+                "{dataset}-{splitter}-ratio{ratio}-rep{rep}-fold{fold}.log",
+            ),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.shard})" "$(dirname {log})"
+            EXPERIMENT_CONFIG="{params.cfg}" \
+            JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/run_ad_annotation.jl \
+                "{wildcards.dataset}" "{wildcards.splitter}" "{wildcards.ratio}" \
+                "{wildcards.rep}" "{wildcards.fold}" \
+                "{input.split}" "{input.model_selection}" "{output.shard}" \
+                2>&1 | tee {log}
+            """
+
+    rule gather_ad_annotation_champion:
+        """Concatenate all AD-annotated champion shards for one dataset, then delete shards."""
+        input:
+            shards=lambda wc: [
+                ad_annotation_champion_shard_path(wc.dataset, s, r, rep, f)
+                for s   in SPLITTERS
+                for r   in RATIOS
+                for rep in REPS
+                for f   in FOLDS
+            ],
+        output:
+            out=os.path.join(OUT_ROOT, "ad_champion", "{dataset}.arrow"),
+        threads: 1
+        resources:
+            mem_mb=lambda wc: gather_mem_mb(wc.dataset),
+            runtime=360,
+            cpus_per_task=1,
+        log:
+            os.path.join(OUT_ROOT, "logs", "gather", "{dataset}-ad-champion.log"),
+        shell:
+            r"""
+            mkdir -p "$(dirname {output.out})" "$(dirname {log})"
+            SLIST=$(mktemp --suffix=.shardlist)
+            printf '%s\n' {input.shards} > "$SLIST"
+            JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_predictions.jl \
+                "{output.out}" "@$SLIST" \
+                2>&1 | tee -a {log} && \
+            rm -f "$SLIST"
+            """
+
+
+# ---------------------------------------------------------------------------
+# Benchmark consolidation — gather per-job TSV files into one Arrow per type
+# ---------------------------------------------------------------------------
+
+def _bench_subdir(name):
+    return os.path.join(OUT_ROOT, "benchmarks", name)
+
+def _bench_arrow(name):
+    return os.path.join(OUT_ROOT, "benchmarks", f"{name}.arrow")
+
+_n_split_benchmarks      = len(DATASETS) * len(SPLITTERS) * len(RATIOS) * len(REPS) * len(FOLDS)
+_n_model_benchmarks      = len(DATASETS) * len(MODEL_METHODS) * len(SPLITTERS) * len(RATIOS) * len(REPS) * len(FOLDS)
+_n_champion_benchmarks   = len(DATASETS) * len(SPLITTERS) * len(RATIOS) * len(REPS) * len(FOLDS)
+
+rule gather_benchmarks_splits:
+    """Consolidate split_one benchmark TSVs into one Arrow file."""
+    input:
+        proxy=[consolidated_split_path(d, s, r)
+               for d in DATASETS for s in SPLITTERS for r in RATIOS],
+    output: _bench_arrow("splits"),
+    resources:
+        mem_mb=4000,
+        runtime=60,
+        cpus_per_task=1,
+    params:
+        subdir=_bench_subdir("splits"),
+        expected=_n_split_benchmarks,
+    shell:
+        r'JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_benchmarks.jl --expected {params.expected} "{params.subdir}" "{output}"'
+
+rule gather_benchmarks_predictions:
+    """Consolidate run_model benchmark TSVs into one Arrow file."""
+    input:
+        proxy=ALL_PREDICTIONS,
+    output: _bench_arrow("predictions"),
+    resources:
+        mem_mb=4000,
+        runtime=60,
+        cpus_per_task=1,
+    params:
+        subdir=_bench_subdir("predictions"),
+        expected=_n_model_benchmarks,
+    shell:
+        r'JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_benchmarks.jl --expected {params.expected} "{params.subdir}" "{output}"'
+
+rule gather_benchmarks_ad_annotation:
+    """Consolidate run_ad_annotation benchmark TSVs into one Arrow file."""
+    input:
+        proxy=ALL_AD_PREDICTIONS,
+    output: _bench_arrow("layer3"),
+    resources:
+        mem_mb=4000,
+        runtime=60,
+        cpus_per_task=1,
+    params:
+        subdir=_bench_subdir("layer3"),
+        expected=_n_model_benchmarks,
+    shell:
+        r'JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_benchmarks.jl --expected {params.expected} "{params.subdir}" "{output}"'
+
+rule gather_benchmarks_split_metrics:
+    """Consolidate compute_split_metrics_one benchmark TSVs into one Arrow file."""
+    input:
+        proxy=ALL_SPLIT_METRICS,
+    output: _bench_arrow("split_metrics"),
+    resources:
+        mem_mb=4000,
+        runtime=60,
+        cpus_per_task=1,
+    params:
+        subdir=_bench_subdir("split_metrics"),
+        expected=_n_split_benchmarks,
+    shell:
+        r'JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_benchmarks.jl --expected {params.expected} "{params.subdir}" "{output}"'
+
+if LAYER2_ENABLED:
+    rule gather_benchmarks_model_selection:
+        """Consolidate run_model_selection benchmark TSVs into one Arrow file."""
+        input:
+            proxy=ALL_CHAMPION_PREDICTIONS,
+        output: _bench_arrow("champion"),
+        resources:
+            mem_mb=4000,
+            runtime=60,
+            cpus_per_task=1,
+        params:
+            subdir=_bench_subdir("champion"),
+            expected=_n_champion_benchmarks,
+        shell:
+            r'JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_benchmarks.jl --expected {params.expected} "{params.subdir}" "{output}"'
+
+    rule gather_benchmarks_ad_annotation_champion:
+        """Consolidate run_ad_annotation_champion benchmark TSVs into one Arrow file."""
+        input:
+            proxy=ALL_CHAMPION_AD,
+        output: _bench_arrow("ad_champion"),
+        resources:
+            mem_mb=4000,
+            runtime=60,
+            cpus_per_task=1,
+        params:
+            subdir=_bench_subdir("ad_champion"),
+            expected=_n_champion_benchmarks,
+        shell:
+            r'JULIA_CONDAPKG_BACKEND=Null JULIA_PYTHONCALL_EXE=$(pwd)/.CondaPkg/.pixi/envs/default/bin/python julia --compiled-modules=existing --project=. scripts/gather_benchmarks.jl --expected {params.expected} "{params.subdir}" "{output}"'
+
+
+# ---------------------------------------------------------------------------
+# Shard cleanup — delete intermediate prediction shards per (dataset, model)
+# as soon as all three consumers for that combination are done, without
+# waiting for the rest of the pipeline. Sentinel files prevent re-deletion.
+# Using explicit rules rather than temp() so --delete-temp-output is safe.
+# ---------------------------------------------------------------------------
+
+rule cleanup_prediction_shards:
+    """Delete shards for one (dataset, model) once all consumers have finished."""
+    input:
+        predictions = lambda wc: predictions_path(wc.dataset, wc.model),
+        ad          = lambda wc: ad_annotation_path(wc.dataset, wc.model),
+        layer1      = lambda wc: layer1_summary_path(wc.dataset, wc.model),
+    output:
+        sentinel=os.path.join(
+            OUT_ROOT, "predictions", "shards", "{dataset}", "{model}", ".cleaned"
+        ),
+    localrule: True
+    shell:
+        r"""
+        find "$(dirname {output.sentinel})" -name "*.arrow" -delete
+        touch "{output.sentinel}"
+        """
+
+if LAYER2_ENABLED:
+    rule cleanup_champion_shards:
+        """Delete champion shards for one dataset once all consumers have finished."""
+        input:
+            champion = lambda wc: champion_predictions_path(wc.dataset),
+            ad       = lambda wc: ad_annotation_champion_path(wc.dataset),
+        output:
+            sentinel=os.path.join(
+                OUT_ROOT, "champion_predictions", "shards", "{dataset}", ".cleaned"
+            ),
+        localrule: True
+        shell:
+            r"""
+            find "$(dirname {output.sentinel})" -name "*.arrow" -delete
+            touch "{output.sentinel}"
+            """

@@ -1,0 +1,55 @@
+executor: slurm
+
+# Keep the submission budget high enough to saturate the queue. If short is
+# capped at 50 running jobs / 100 submitted jobs per user, letting Snakemake
+# hold a backlog of 100 jobs is expected and helps throughput.
+jobs: 250
+cores: 2000
+
+latency-wait: 90
+rerun-incomplete: true
+printshellcmds: true
+show-failed-logs: true
+retries: 1
+keep-going: true
+
+slurm-status-command: sacct
+slurm-logdir: ".snakemake/slurm_logs"
+slurm-keep-successful-logs: true
+slurm-delete-logfiles-older-than: 30
+
+default-resources:
+  # CESGA assigns QOS/partition automatically from requested resources.
+  # Ask only for the required walltime and memory unless a special case needs
+  # an explicit override.
+  runtime: "6h"
+  constraint: "clk"
+
+set-threads:
+  run_ad_annotation: 1
+  run_ad_annotation_champion: 1
+  split_one: 1
+  compute_split_metrics_one: 1
+
+set-resources:
+  # Only long-runtime overrides live here. CESGA will map them to the correct
+  # queue automatically from the requested walltime.
+  run_hyperopt:
+    runtime: "3d"
+    constraint: "clk"
+  # The SLURM executor allocates max(cpus_per_task) across group members for
+  # the group SLURM job, so we must request the full group width here.
+  # 4 jobs × 1 CPU each → request 4 CPUs so the inner Snakemake gets
+  # --local-cores 4 and runs all 4 jobs in parallel.
+
+groups:
+  run_model: model_batch
+  run_ad_annotation: ad_annotation_batch
+  run_ad_annotation_champion: ad_annotation_champion_batch
+  compute_split_metrics_one: metrics_batch
+
+group-components:
+  model_batch: 2
+  ad_annotation_batch: 4
+  ad_annotation_champion_batch: 4
+  metrics_batch: 10

@@ -1,0 +1,6 @@
+outs:
+- md5: 18613a406bc8263b1088219db748bcce.dir
+  size: 146693830
+  nfiles: 32
+  hash: md5
+  path: merck

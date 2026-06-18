@@ -1,0 +1,4 @@
+# Ignore all computed split data except DVC-tracked CV folds
+# DVC pointer files (*.dvc) and the cv/ dirs are tracked by git/DVC
+*/*
+!*/cv/
