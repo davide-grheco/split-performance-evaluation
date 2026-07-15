@@ -32,6 +32,8 @@ export dataset_names, metrics_results, merge_repeated_run_results, mean_scores_b
     compute_fold_selection_quality, aggregate_selection_by_dataset
 # Statistical tests
 export FriedmanTest, iman_davenport, NemenyiResult, nemenyi, nemenyi_after_iman
+# Multicriteria decision analysis (TOPSIS / MOORA)
+export MCDAResult, topsis_rank, moora_rank, mcda_rank
 # Plotting
 export cd_diagram, nemenyi_heatmap, plot_per_dataset_spread, DEFAULT_COLOR_SCHEME
 
@@ -50,6 +52,7 @@ include("Utils.jl")
 include("Precomputation.jl")
 include("Friedman.jl")
 include("Nemenyi.jl")
+include("MCDA.jl")
 include("AnalysisUtils.jl")
 include("Plotting.jl")
 include("ExperimentLoader.jl")

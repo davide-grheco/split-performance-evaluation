@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "80d3c2ed39a7eefaf2f9087a28425ed46a2f5713"
+project_hash = "ae8f897a6d1f69ea4df026a010d5d7db94812276"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
@@ -1373,6 +1373,12 @@ deps = ["Artifacts", "Preferences"]
 git-tree-sha1 = "7204148362dafe5fe6a273f855b8ccbe4df8173e"
 uuid = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
 version = "1.8.0"
+
+[[deps.JMcDM]]
+deps = ["Requires"]
+git-tree-sha1 = "979229c5c01c249f550b0f596e61ceb153dcc7e6"
+uuid = "358108f5-d052-4d0a-8344-d5384e00c0e5"
+version = "0.8.3"
 
 [[deps.JSON]]
 deps = ["Dates", "Mmap", "Parsers", "Unicode"]

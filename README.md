@@ -62,6 +62,9 @@ EXPERIMENT=revision_v1_sub1000 FIG_DIR=images/revision_v1_sub1000 \
 # Sub-150 sensitivity
 EXPERIMENT=revision_v1_sub150 FIG_DIR=images/revision_v1_sub150 \
   SKIP_CHAMPION=1 julia --project=. scripts/generate_article_figures.jl
+
+# Multicriteria decision analysis (TOPSIS/MOORA overall ranking + trade-off figure)
+julia --project=. scripts/generate_mcda.jl
 ```
 
 ---
